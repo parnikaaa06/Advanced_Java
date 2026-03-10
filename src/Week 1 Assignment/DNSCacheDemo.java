@@ -1,108 +1,136 @@
-import java.time.Instant;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.Supplier;
+import java.net.InetAddress;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
-public class DistributedRateLimiter {
-    private static final long WINDOW_SECONDS = 3600;
-    private static final int MAX_RETRIES = 8;
+public class DNSCacheDemo {
 
-    private final int maxTokens;
-    private final double refillRatePerSecond;
-    private final BucketStore store;
+    static class DNSEntry {
+        String ipAddress;
+        long timestamp;
+        long expiryTime;
 
-    public DistributedRateLimiter(int maxTokensPerHour, BucketStore store) {
-        this.maxTokens = maxTokensPerHour;
-        this.refillRatePerSecond = maxTokensPerHour / (double) WINDOW_SECONDS;
-        this.store = store;
+        DNSEntry(String ipAddress, int ttlSeconds) {
+            this.timestamp = System.currentTimeMillis();
+            this.expiryTime = this.timestamp + ttlSeconds * 1000L;
+            this.ipAddress = ipAddress;
+        }
+
+        boolean isExpired() {
+            return System.currentTimeMillis() >= expiryTime;
+        }
     }
 
-    public RateLimitResult checkRateLimit(String clientId) {
-        long now = Instant.now().getEpochSecond();
+    static class DNSCache {
+        private final int capacity;
+        private final HashMap<String, DNSEntry> table = new HashMap<>();
+        private final LinkedHashMap<String, Boolean> lru = new LinkedHashMap<>(16, 0.75f, true);
 
-        for (int i = 0; i < MAX_RETRIES; i++) {
-            Bucket current = store.getOrCreate(clientId, () -> new Bucket(maxTokens, now));
-            Bucket refilled = refill(current, now);
+        private long hits = 0, misses = 0, totalLookups = 0;
+        private double totalLookupMs = 0;
+        private volatile boolean running = true;
 
-            if (refilled.tokens < 1.0) {
-                long retryAfter = Math.max(1, (long) Math.ceil((1.0 - refilled.tokens) / refillRatePerSecond));
-                int remaining = (int) Math.max(0, Math.floor(refilled.tokens));
-                long reset = now + Math.max(0, (long) Math.ceil((maxTokens - refilled.tokens) / refillRatePerSecond));
-                return new RateLimitResult(false, remaining, retryAfter,
-                        "Denied (" + remaining + " requests remaining, retry after " + retryAfter + "s)",
-                        new RateLimitStatus(maxTokens - remaining, maxTokens, reset));
+        DNSCache(int capacity, int cleanupIntervalSeconds) {
+            this.capacity = capacity;
+
+            Thread cleaner = new Thread(() -> {
+                while (running) {
+                    removeExpiredEntries();
+                    try {
+                        Thread.sleep(cleanupIntervalSeconds * 1000L);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            });
+            cleaner.setDaemon(true);
+            cleaner.start();
+        }
+
+        private String queryUpstream(String domain) throws Exception {
+            return InetAddress.getByName(domain).getHostAddress();
+        }
+
+        private void evictIfNeeded() {
+            while (table.size() > capacity) {
+                Iterator<String> it = lru.keySet().iterator();
+                if (!it.hasNext()) return;
+                String leastRecentlyUsed = it.next();
+                it.remove();
+                table.remove(leastRecentlyUsed);
+            }
+        }
+
+        public synchronized String resolve(String domain, int ttlSeconds) throws Exception {
+            long start = System.nanoTime();
+            totalLookups++;
+
+            DNSEntry entry = table.get(domain);
+            if (entry != null && !entry.isExpired()) {
+                hits++;
+                lru.get(domain);
+                totalLookupMs += (System.nanoTime() - start) / 1_000_000.0;
+                return entry.ipAddress;
             }
 
-            Bucket updated = new Bucket(refilled.tokens - 1.0, refilled.lastRefillEpochSec);
-            if (store.compareAndSet(clientId, current, updated)) {
-                int remaining = (int) Math.max(0, Math.floor(updated.tokens));
-                long reset = now + Math.max(0, (long) Math.ceil((maxTokens - updated.tokens) / refillRatePerSecond));
-                return new RateLimitResult(true, remaining, 0,
-                        "Allowed (" + remaining + " requests remaining)",
-                        new RateLimitStatus(maxTokens - remaining, maxTokens, reset));
+            if (entry != null && entry.isExpired()) {
+                table.remove(domain);
+                lru.remove(domain);
+            }
+
+            misses++;
+            String ip = queryUpstream(domain);
+            table.put(domain, new DNSEntry(ip, ttlSeconds));
+            lru.put(domain, true);
+            evictIfNeeded();
+
+            totalLookupMs += (System.nanoTime() - start) / 1_000_000.0;
+            return ip;
+        }
+
+        public synchronized void removeExpiredEntries() {
+            Iterator<Map.Entry<String, DNSEntry>> it = table.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<String, DNSEntry> item = it.next();
+                if (item.getValue().isExpired()) {
+                    lru.remove(item.getKey());
+                    it.remove();
+                }
             }
         }
 
-        return new RateLimitResult(false, 0, 1,
-                "Denied (system busy, retry after 1s)",
-                new RateLimitStatus(maxTokens, maxTokens, now + WINDOW_SECONDS));
-    }
-
-    public RateLimitStatus getRateLimitStatus(String clientId) {
-        long now = Instant.now().getEpochSecond();
-        Bucket current = store.getOrCreate(clientId, () -> new Bucket(maxTokens, now));
-        Bucket refilled = refill(current, now);
-        int remaining = (int) Math.max(0, Math.floor(refilled.tokens));
-        long reset = now + Math.max(0, (long) Math.ceil((maxTokens - refilled.tokens) / refillRatePerSecond));
-        return new RateLimitStatus(maxTokens - remaining, maxTokens, reset);
-    }
-
-    private Bucket refill(Bucket b, long nowEpochSec) {
-        if (nowEpochSec <= b.lastRefillEpochSec) {
-            return b;
-        }
-        long elapsed = nowEpochSec - b.lastRefillEpochSec;
-        double tokens = Math.min(maxTokens, b.tokens + elapsed * refillRatePerSecond);
-        return new Bucket(tokens, nowEpochSec);
-    }
-
-    public record RateLimitResult(
-            boolean allowed,
-            int remaining,
-            long retryAfterSeconds,
-            String message,
-            RateLimitStatus status
-    ) {}
-
-    public record RateLimitStatus(int used, int limit, long resetEpochSeconds) {}
-
-    public record Bucket(double tokens, long lastRefillEpochSec) {}
-
-    public interface BucketStore {
-        Bucket getOrCreate(String clientId, Supplier<Bucket> init);
-        boolean compareAndSet(String clientId, Bucket expected, Bucket updated);
-    }
-
-    public static class InMemoryBucketStore implements BucketStore {
-        private final ConcurrentHashMap<String, AtomicReference<Bucket>> map = new ConcurrentHashMap<>();
-
-        @Override
-        public Bucket getOrCreate(String clientId, Supplier<Bucket> init) {
-            AtomicReference<Bucket> ref = map.computeIfAbsent(clientId, k -> new AtomicReference<>(init.get()));
-            return ref.get();
+        public synchronized String getCacheStats() {
+            long total = hits + misses;
+            double hitRate = total == 0 ? 0 : (hits * 100.0 / total);
+            double missRate = total == 0 ? 0 : (misses * 100.0 / total);
+            double avgLookup = totalLookups == 0 ? 0 : (totalLookupMs / totalLookups);
+            return String.format("Hit Rate: %.2f%%, Miss Rate: %.2f%%, Avg Lookup Time: %.3fms",
+                    hitRate, missRate, avgLookup);
         }
 
-        @Override
-        public boolean compareAndSet(String clientId, Bucket expected, Bucket updated) {
-            AtomicReference<Bucket> ref = map.get(clientId);
-            return ref != null && ref.compareAndSet(expected, updated);
+        public void stop() {
+            running = false;
         }
     }
 
-    public static void main(String[] args) {
-        DistributedRateLimiter limiter = new DistributedRateLimiter(1000, new InMemoryBucketStore());
-        System.out.println(limiter.checkRateLimit("abc123").message());
-        System.out.println(limiter.checkRateLimit("abc123").message());
-        System.out.println(limiter.getRateLimitStatus("abc123"));
+    public static void main(String[] args) throws Exception {
+        DNSCache cache = new DNSCache(3, 1);
+        String domain = "google.com";
+        int ttl = 3;
+
+        String ip1 = cache.resolve(domain, ttl);
+        System.out.println("resolve(\"google.com\") -> Cache MISS -> " + ip1 + " (TTL: 3s)");
+
+        String ip2 = cache.resolve(domain, ttl);
+        System.out.println("resolve(\"google.com\") -> Cache HIT -> " + ip2);
+
+        Thread.sleep(4000);
+
+        String ip3 = cache.resolve(domain, ttl);
+        System.out.println("resolve(\"google.com\") -> Cache EXPIRED -> Query upstream -> " + ip3);
+
+        System.out.println("getCacheStats() -> " + cache.getCacheStats());
+        cache.stop();
     }
 }
